@@ -415,7 +415,7 @@ def main():
     # PyTorch state_dict 형태로 저장
     torch.save(trained_model.state_dict(), "avoidblurp_dqn_basic_reward.pt")
     env.close()
-    print("[INFO] Training finished. Model saved to avoidblurp_dqn_basic_reward.pt")
+    print("[INFO] Training finished. Model saved to avoidblurp_dqn_basic_reward_v2.pt")
 
 
 if __name__ == "__main__":

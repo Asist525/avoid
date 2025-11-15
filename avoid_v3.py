@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-AvoidBlurp-Normal-v0 환경에서 DQN 학습 스크립트 (PyTorch 리팩터링 버전)
+AvoidBlurp-Normal-v0 환경에서 DQN 학습 스크립트 (PyTorch 리팩터링 버전, V3: Double DQN + frame)
 
 - obs_type="image" (750x600x3 RGB)
 - Q-network: CNN + GlobalAveragePooling + Dense
 - frame stacking 사용 (기본 4프레임)
+- Double DQN 타깃 사용
 - 보상 설계:
     * 매 step 살아있으면 +ALIVE_REWARD
     * 2분 완주(terminated=True) 시 SUCCESS_BONUS 추가
@@ -129,7 +130,7 @@ class QNetwork(nn.Module):
 @dataclass
 class TrainConfig:
     # 에피소드 관련
-    episodes: int = 20000
+    episodes: int = 8000
 
     # DQN 관련
     gamma: float = 0.99
@@ -258,11 +259,11 @@ class ReplayBuffer:
 
 
 # ====================================================
-# 5. 학습 루프 (PyTorch)
+# 5. 학습 루프 (PyTorch, V3: Double DQN)
 # ====================================================
 
 def train_dqn(env: gym.Env, model: QNetwork, cfg: TrainConfig):
-    """DQN 학습 메인 루프."""
+    """Double DQN 학습 메인 루프."""
 
     # Target network 초기화
     target_model = QNetwork(
@@ -322,7 +323,7 @@ def train_dqn(env: gym.Env, model: QNetwork, cfg: TrainConfig):
 
                 with torch.no_grad():
                     q_values = model(state_input)[0]              # (A,) on DEVICE
-                    # GPU에서 argmax 후 scalar만 CPU로 가져오기 (cpu-gpu 왕복 최소화)
+                    # GPU에서 argmax 후 scalar만 CPU로 가져오기
                     action = int(torch.argmax(q_values).item())
 
             # --- 환경 step ---
@@ -375,11 +376,21 @@ def train_dqn(env: gym.Env, model: QNetwork, cfg: TrainConfig):
                     done_batch.astype(np.float32)
                 ).to(DEVICE)                                           # (B,)
 
-                # Q(s,a)와 타깃 계산
+                # -----------------------------
+                # Double DQN 타깃 계산 부분
+                # -----------------------------
                 q_curr = model(s_batch_t)                   # (B, A)
+
                 with torch.no_grad():
-                    q_next = target_model(s2_batch_t)       # (B, A)
-                    max_next_q, _ = torch.max(q_next, dim=1)  # (B,)
+                    # 1) online 네트워크로 argmax a' = argmax_a Q_online(s', a)
+                    q_next_online = model(s2_batch_t)                       # (B, A)
+                    next_actions = torch.argmax(q_next_online, dim=1)       # (B,)
+
+                    # 2) target 네트워크에서 그 action의 값만 사용
+                    q_next_target = target_model(s2_batch_t)                # (B, A)
+                    max_next_q = q_next_target.gather(
+                        1, next_actions.unsqueeze(1)
+                    ).squeeze(1)                                            # (B,)
 
                     target_q = r_batch_t + cfg.gamma * max_next_q * (1.0 - done_batch_t)
 
@@ -455,10 +466,10 @@ def main():
 
     trained_model, reward_history = train_dqn(env, model, cfg)
 
-    # PyTorch state_dict 형태로 저장
+    # PyTorch state_dict 형태로 저장 (V3)
     torch.save(trained_model.state_dict(), "avoidblurp_dqn_basic_reward_framestack_v3.pt")
     env.close()
-    print("[INFO] Training finished. Model saved to avoidblurp_dqn_basic_reward_framestack.pt")
+    print("[INFO] Training finished. Model saved to avoidblurp_dqn_basic_reward_framestack_v3.pt")
 
 
 if __name__ == "__main__":
