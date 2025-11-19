@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-AvoidBlurp-Normal-v0 환경에서 DQN 학습 스크립트 (PyTorch 리팩터링 버전)
+AvoidBlurp-Normal-v0 환경에서 DQN 학습 스크립트 (PyTorch, DDQN + Dueling, Crop 전처리)
 
 - obs_type="image" (750x600x3 RGB)
-- Q-network: CNN + GlobalAveragePooling + Dense
+- 전처리:
+    * 상하단 일부 crop 후
+    * Grayscale + 84x84 resize
+- Q-network: CNN + GlobalAveragePooling + Dueling Head(Value + Advantage)
 - 보상 설계:
     * 매 step 살아있으면 +ALIVE_REWARD
     * 2분 완주(terminated=True) 시 SUCCESS_BONUS 추가
@@ -37,7 +40,7 @@ print(f"[INFO] Using device: {DEVICE}")
 def make_env(render_mode: str = "rgb_array") -> gym.Env:
     """AvoidBlurp 환경 생성."""
     env = gym.make(
-        id="kymnasium/AvoidBlurp-Hard-v0",
+        id="kymnasium/AvoidBlurp-Normal-v0",
         render_mode=render_mode,  # "rgb_array" (학습용)
         bgm=False,
         obs_type="image",
@@ -46,13 +49,15 @@ def make_env(render_mode: str = "rgb_array") -> gym.Env:
 
 
 # ====================================================
-# 2. Q-network (PyTorch)
+# 2. Q-network (PyTorch, Dueling)
 # ====================================================
 
 class QNetwork(nn.Module):
     """
-    입력: (B, 1, 84, 84)  [그레이스케일 후 리사이즈]
+    입력: (B, 1, 84, 84)  [crop + 그레이스케일 + 리사이즈]
     출력: (B, n_actions)  [각 행동의 Q값]
+    Dueling 구조:
+        Q(s,a) = V(s) + (A(s,a) - mean_a A(s,a))
     """
 
     def __init__(self, in_channels: int, n_actions: int, seed: int = 42):
@@ -77,22 +82,26 @@ class QNetwork(nn.Module):
             nn.MaxPool2d(2),
         )
 
-        # Keras의 GlobalAveragePooling2D와 동일
+        # GlobalAveragePooling2D
         self.gap = nn.AdaptiveAvgPool2d((1, 1))
+        self.flatten = nn.Flatten()  # (B, 128*1*1) -> (B, 128)
 
-        self.fc = nn.Sequential(
-            nn.Flatten(),           # (B, 128*1*1) -> (B, 128)
+        # Dueling head
+        self.value_stream = nn.Sequential(
             nn.Linear(128, 64),
             nn.ReLU(),
-            nn.Linear(64, 32),
+            nn.Linear(64, 1),         # V(s)
+        )
+        self.adv_stream = nn.Sequential(
+            nn.Linear(128, 64),
             nn.ReLU(),
-            nn.Linear(32, n_actions),
+            nn.Linear(64, n_actions), # A(s,a)
         )
 
         self._init_weights()
 
     def _init_weights(self):
-        # Keras의 HeNormal/GlorotNormal에 대응하는 초기화
+        # He / Xavier 초기화
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
@@ -104,10 +113,16 @@ class QNetwork(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.features(x)
-        x = self.gap(x)
-        x = self.fc(x)
-        return x
+        x = self.features(x)     # (B, 128, h, w)
+        x = self.gap(x)          # (B, 128, 1, 1)
+        x = self.flatten(x)      # (B, 128)
+
+        v = self.value_stream(x)               # (B, 1)
+        a = self.adv_stream(x)                 # (B, A)
+        a_mean = a.mean(dim=1, keepdim=True)   # (B, 1)
+
+        q = v + (a - a_mean)                   # (B, A)
+        return q
 
 
 # ====================================================
@@ -159,7 +174,7 @@ def calc_epsilon(
     decay_ratio: float,
     final_ratio: float,
 ) -> float:
-    """에피소드 수 기준 epsilon 값을 piecewise로 계산 (기존 Keras 버전 그대로)."""
+    """에피소드 수 기준 epsilon 값을 piecewise로 계산."""
     warmup = int(max_ep * warmup_ratio)
     decay = int(max_ep * decay_ratio)
     final = int(max_ep * final_ratio)
@@ -195,21 +210,33 @@ def calc_epsilon(
 def preprocess(obs: np.ndarray) -> np.ndarray:
     """
     (H, W, C) uint8 관측을
-      -> float32 [0,1]
+      -> 상하단 일부 crop
+      -> float32 [0,1] 정규화
       -> (1, 1, 84, 84) 그레이스케일로 변환해 numpy로 반환.
-    (학습 시에만 torch.Tensor로 변환해서 GPU로 보냄)
     """
-    # numpy -> torch (CPU)
+    # numpy -> torch (CPU), 0~1 스케일
     x = torch.from_numpy(obs).float() / 255.0          # (H, W, C)
     x = x.permute(2, 0, 1).unsqueeze(0)               # (1, C, H, W)
 
+    # ---- 상하단 crop (HUD/배경 일부 제거) ----
+    _, _, H, W = x.shape
+    top = int(H * 0.10)       # 위쪽 10% 자르기
+    bottom = int(H * 0.90)    # 아래쪽 10% 자르기
+
+    # 혹시라도 너무 극단적일 때를 대비한 방어 코드
+    if bottom <= top + 1:
+        top = 0
+        bottom = H
+
+    x = x[:, :, top:bottom, :]      # (1, C, H', W)
+
     # RGB -> Gray
     r, g, b = x[:, 0:1, :, :], x[:, 1:2, :, :], x[:, 2:3, :, :]
-    x = 0.2989 * r + 0.5870 * g + 0.1140 * b          # (1, 1, H, W)
+    x = 0.2989 * r + 0.5870 * g + 0.1140 * b          # (1, 1, H', W)
 
     # Resize to 84x84 (bilinear)
     x = F.interpolate(x, size=(84, 84), mode="bilinear", align_corners=False)
-    return x.numpy()  # (1, 1, 84, 84)
+    return x.numpy()  # (1, 1, 84, 84), float32, 0~1
 
 
 class ReplayBuffer:
@@ -230,7 +257,7 @@ class ReplayBuffer:
             np.concatenate(s, axis=0),                   # (B, 1, 84, 84)
             np.array(a, dtype=np.int64),                # (B,)
             np.array(r, dtype=np.float32),              # (B,)
-            np.concatenate(s2, axis=0),                  # (B, 1, 84, 84)
+            np.concatenate(s2, axis=0),                 # (B, 1, 84, 84)
             np.array(d, dtype=np.bool_),                # (B,)
         )
 
@@ -239,11 +266,11 @@ class ReplayBuffer:
 
 
 # ====================================================
-# 5. 학습 루프 (PyTorch)
+# 5. 학습 루프 (PyTorch, Double DQN + Dueling)
 # ====================================================
 
 def train_dqn(env: gym.Env, model: QNetwork, cfg: TrainConfig):
-    """DQN 학습 메인 루프 (Keras 버전 로직을 그대로 반영)."""
+    """DQN 학습 메인 루프 (Double DQN 타깃 사용)."""
 
     # Target network 초기화
     target_model = QNetwork(in_channels=1, n_actions=env.action_space.n, seed=cfg.seed).to(DEVICE)
@@ -322,7 +349,7 @@ def train_dqn(env: gym.Env, model: QNetwork, cfg: TrainConfig):
             ep_reward += reward
             steps += 1
 
-            # --- DQN Update ---
+            # --- DQN Update (Double DQN 타깃) ---
             if len(replay) >= cfg.train_start:
                 (
                     s_batch,
@@ -339,11 +366,21 @@ def train_dqn(env: gym.Env, model: QNetwork, cfg: TrainConfig):
                 r_batch_t = torch.from_numpy(r_batch).to(DEVICE)           # (B,)
                 done_batch_t = torch.from_numpy(done_batch.astype(np.float32)).to(DEVICE)  # (B,)
 
-                # Q(s,a)와 타깃 계산
-                q_curr = model(s_batch_t)                   # (B, A)
+                # ---------------------------------
+                # Double DQN target 계산 부분
+                # ---------------------------------
+                q_curr = model(s_batch_t)  # (B, A)
+
                 with torch.no_grad():
-                    q_next = target_model(s2_batch_t)       # (B, A)
-                    max_next_q, _ = torch.max(q_next, dim=1)  # (B,)
+                    # 1) online 네트워크로 a' = argmax_a Q_online(s', a) 선택
+                    q_next_online = model(s2_batch_t)                 # (B, A)
+                    next_actions = torch.argmax(q_next_online, dim=1) # (B,)
+
+                    # 2) target 네트워크에서 그 action의 Q값만 사용
+                    q_next_target = target_model(s2_batch_t)          # (B, A)
+                    max_next_q = q_next_target.gather(
+                        1, next_actions.unsqueeze(1)
+                    ).squeeze(1)                                      # (B,)
 
                     target_q = r_batch_t + cfg.gamma * max_next_q * (1.0 - done_batch_t)
 
@@ -413,9 +450,9 @@ def main():
     trained_model, reward_history = train_dqn(env, model, cfg)
 
     # PyTorch state_dict 형태로 저장
-    torch.save(trained_model.state_dict(), "avoidblurp_dqn_basic_reward_hard_v2.pt")
+    torch.save(trained_model.state_dict(), "avoidblurp_ddqn_dueling_crop_v1.pt")
     env.close()
-    print("[INFO] Training finished. Model saved to avoidblurp_dqn_basic_reward_v2.pt")
+    print("[INFO] Training finished. Model saved to avoidblurp_ddqn_dueling_crop_v1.pt")
 
 
 if __name__ == "__main__":

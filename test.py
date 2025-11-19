@@ -5,7 +5,7 @@ import numpy as np
 
 from avoid import QNetwork, preprocess   # 네 파일 이름에 맞게
 
-MODEL_PATH = "/home/ubuntu/avoid/avoid/avoidblurp_dqn_basic_reward.pt"
+MODEL_PATH = "/home/ubuntu/avoid/avoid/avoidblurp_dqn_basic_reward_hard.pt"
 
 
 class AvoidBlurpDQNAgent(kym.Agent):

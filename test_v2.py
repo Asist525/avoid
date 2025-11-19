@@ -5,7 +5,7 @@ import numpy as np
 
 from avoid_v2 import QNetwork, preprocess   # 학습과 동일한 함수 import
 
-MODEL_PATH = "/home/ubuntu/avoid/avoid/avoidblurp_dqn_basic_reward_framestack_v2.pt"
+MODEL_PATH = "/home/ubuntu/avoid/avoid/avoidblurp_dqn_basic_reward_framestack_v3.pt"
 FRAME_STACK = 4  # 학습과 반드시 동일해야 함
 
 
