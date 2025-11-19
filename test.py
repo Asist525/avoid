@@ -3,7 +3,7 @@ import kymnasium as kym
 import torch
 import numpy as np
 
-from avoid import QNetwork, preprocess   # 네 파일 이름에 맞게
+from avoid import QNetwork, preprocess   
 
 MODEL_PATH = "/home/ubuntu/avoid/avoid/avoidblurp_dqn_basic_reward_hard.pt"
 
@@ -39,7 +39,7 @@ class AvoidBlurpDQNAgent(kym.Agent):
         q_values = self.model(state)[0]
         return int(q_values.argmax().item())
 
-    # 필수 구현 (더미)
+
     def save(self, path: str):
         pass
 
